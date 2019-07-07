@@ -165,15 +165,20 @@ class FullTokenizer(object):
     self.vocab = load_vocab(vocab_file)
     self.inv_vocab = {v: k for k, v in self.vocab.items()}
     self.basic_tokenizer = BasicTokenizer(do_lower_case=do_lower_case)
-    self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab)
+    # self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab)
 
   def tokenize(self, text):
-    split_tokens = []
-    for token in self.basic_tokenizer.tokenize(text):
-      for sub_token in self.wordpiece_tokenizer.tokenize(token):
-        split_tokens.append(sub_token)
+    # ============================================================
+    # WordPiece tokenization (unnecessary for object labels vocab):
+    #
+    # split_tokens = []
+    # for token in self.basic_tokenizer.tokenize(text):
+    #   for sub_token in self.wordpiece_tokenizer.tokenize(token):
+    #     split_tokens.append(sub_token)
 
-    return split_tokens
+    # return split_tokens
+    # ============================================================
+    return self.basic_tokenizer.tokenize(text)
 
   def convert_tokens_to_ids(self, tokens):
     return convert_by_vocab(self.vocab, tokens)
@@ -204,7 +209,7 @@ class BasicTokenizer(object):
     # and generally don't have any Chinese data in them (there are Chinese
     # characters in the vocabulary because Wikipedia does have some Chinese
     # words in the English Wikipedia.).
-    text = self._tokenize_chinese_chars(text)
+    # text = self._tokenize_chinese_chars(text)
 
     orig_tokens = whitespace_tokenize(text)
     split_tokens = []
@@ -212,7 +217,8 @@ class BasicTokenizer(object):
       if self.do_lower_case:
         token = token.lower()
         token = self._run_strip_accents(token)
-      split_tokens.extend(self._run_split_on_punc(token))
+      # split_tokens.extend(self._run_split_on_punc(token))
+      split_tokens.append(token)
 
     output_tokens = whitespace_tokenize(" ".join(split_tokens))
     return output_tokens
