@@ -216,6 +216,10 @@ class BertModel(object):
             do_return_all_layers=True)
 
       self.sequence_output = self.all_encoder_layers[-1]
+
+      # ================================================
+      # Might not be necessary without the sentence task:
+      #
       # The "pooler" converts the encoded sequence tensor of shape
       # [batch_size, seq_length, hidden_size] to a tensor of shape
       # [batch_size, hidden_size]. This is necessary for segment-level
@@ -230,6 +234,7 @@ class BertModel(object):
             config.hidden_size,
             activation=tf.tanh,
             kernel_initializer=create_initializer(config.initializer_range))
+      # ================================================
 
   def get_pooled_output(self):
     return self.pooled_output
