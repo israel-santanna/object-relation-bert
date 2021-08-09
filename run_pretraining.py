@@ -17,6 +17,7 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+from tensorflow.python import debug as tf_debug
 
 import os
 import modeling
@@ -105,10 +106,12 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+flags.DEFINE_string("layers", "-1,-2,-3,-4", "")
+
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     use_one_hot_embeddings, layer_indexes):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -121,10 +124,11 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     input_ids = features["input_ids"]
     input_mask = features["input_mask"]
     segment_ids = features["segment_ids"]
+    bounding_boxes = features["bounding_boxes"]
     masked_lm_positions = features["masked_lm_positions"]
     masked_lm_ids = features["masked_lm_ids"]
     masked_lm_weights = features["masked_lm_weights"]
-    # next_sentence_labels = features["next_sentence_labels"]
+    fake_context_labels = features["fake_context_labels"]
 
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
@@ -132,25 +136,26 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         config=bert_config,
         is_training=is_training,
         input_ids=input_ids,
+        bounding_boxes=bounding_boxes,
         input_mask=input_mask,
         token_type_ids=segment_ids,
         use_one_hot_embeddings=use_one_hot_embeddings)
 
     (masked_lm_loss,
      masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
-         bert_config, model.get_sequence_output(), model.get_embedding_table(),
+         bert_config, model.get_sequence_output(),
          masked_lm_positions, masked_lm_ids, masked_lm_weights)
 
-    # =================================================================
-    # Next sentence prediction task (unnecessary for image level sentences):
-    #
-    # (next_sentence_loss, next_sentence_example_loss,
-    #  next_sentence_log_probs) = get_next_sentence_output(
-    #      bert_config, model.get_pooled_output(), next_sentence_labels)
+    (fake_context_loss, fake_context_example_loss,
+     fake_context_log_probs) = get_fake_context_output(
+         bert_config, model.get_pooled_output(), fake_context_labels)
 
-    # total_loss = masked_lm_loss + next_sentence_loss
-    # =================================================================
-    total_loss = masked_lm_loss
+    (cluster_loss, cluster_example_loss, cluster_fc_predictions,
+      cluster_token_predictions) = get_cluster_distance_output(
+         model.get_all_encoder_layers(), layer_indexes, fake_context_labels,
+         masked_lm_positions)
+
+    total_loss = masked_lm_loss + fake_context_loss + cluster_loss
 
     tvars = tf.trainable_variables()
 
@@ -190,10 +195,10 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     elif mode == tf.estimator.ModeKeys.EVAL:
 
       def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
-                    masked_lm_weights):
-      # def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
-      #               masked_lm_weights, next_sentence_example_loss,
-      #               next_sentence_log_probs, next_sentence_labels):
+                    masked_lm_weights, fake_context_example_loss,
+                    fake_context_log_probs, fake_context_labels,
+                    cluster_example_loss, cluster_fc_predictions,
+                    cluster_token_predictions):
         """Computes the loss and accuracy of the model."""
         masked_lm_log_probs = tf.reshape(masked_lm_log_probs,
                                          [-1, masked_lm_log_probs.shape[-1]])
@@ -209,35 +214,39 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         masked_lm_mean_loss = tf.metrics.mean(
             values=masked_lm_example_loss, weights=masked_lm_weights)
 
-        # =================================================================
-        # Next sentence prediction (unnecessary for image level sentences):
-        #
-        # next_sentence_log_probs = tf.reshape(
-        #     next_sentence_log_probs, [-1, next_sentence_log_probs.shape[-1]])
-        # next_sentence_predictions = tf.argmax(
-        #     next_sentence_log_probs, axis=-1, output_type=tf.int32)
-        # next_sentence_labels = tf.reshape(next_sentence_labels, [-1])
-        # next_sentence_accuracy = tf.metrics.accuracy(
-        #     labels=next_sentence_labels, predictions=next_sentence_predictions)
-        # next_sentence_mean_loss = tf.metrics.mean(
-        #     values=next_sentence_example_loss)
+        fake_context_log_probs = tf.reshape(
+            fake_context_log_probs, [-1, fake_context_log_probs.shape[-1]])
+        fake_context_predictions = tf.argmax(
+            fake_context_log_probs, axis=-1, output_type=tf.int32)
+        fake_context_labels = tf.reshape(fake_context_labels, [-1])
+        fake_context_accuracy = tf.metrics.accuracy(
+            labels=fake_context_labels, predictions=fake_context_predictions)
+        fake_context_mean_loss = tf.metrics.mean(
+            values=fake_context_example_loss)
+
+        cluster_token_predictions = tf.reshape(cluster_token_predictions, [-1])
+        cluster_fc_accuracy = tf.metrics.accuracy(
+            labels=fake_context_labels, predictions=cluster_fc_predictions)
+        cluster_token_accuracy = tf.metrics.accuracy(
+            labels=masked_lm_ids, predictions=cluster_token_predictions)
+        cluster_mean_loss = tf.metrics.mean(
+            values=cluster_example_loss)
 
         return {
             "masked_lm_accuracy": masked_lm_accuracy,
             "masked_lm_loss": masked_lm_mean_loss,
-            # "next_sentence_accuracy": next_sentence_accuracy,
-            # "next_sentence_loss": next_sentence_mean_loss,
+            "fake_context_accuracy": fake_context_accuracy,
+            "fake_context_loss": fake_context_mean_loss,
+            "cluster_fc_accuracy": cluster_fc_accuracy,
+            "cluster_token_accuracy": cluster_token_accuracy,
+            "cluster_loss": cluster_mean_loss
         }
 
-      # eval_metrics = (metric_fn, [
-      #     masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
-      #     masked_lm_weights, next_sentence_example_loss,
-      #     next_sentence_log_probs, next_sentence_labels
-      # ])
-      # =================================================================
       eval_metrics = (metric_fn, [
           masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
-          masked_lm_weights
+          masked_lm_weights, fake_context_example_loss, fake_context_log_probs,
+          fake_context_labels, cluster_example_loss, cluster_fc_predictions,
+          cluster_token_predictions
       ])
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
@@ -251,8 +260,52 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
   return model_fn
 
+def get_cluster_distance_output(all_layers, layer_indexes, fake_context_labels, masked_positions, threshold=0.5):
+  layers = []
+  for (i, layer_index) in enumerate(layer_indexes):
+    layers.append(all_layers[layer_index])
 
-def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
+  # Scalar dimensions referenced here:
+  #   B = batch size (number of sequences)
+  #   S = tensor sequence length
+  #   E = embedding size = number of layers * hidden size
+  # [B, S, E]
+  embeddings = tf.concat(layers, axis=2)
+  embeddings_shape = modeling.get_shape_list(embeddings)
+  batch_size = embeddings_shape[0]
+  seq_length = embeddings_shape[1]
+  embedding_size = embeddings_shape[2]
+
+  embeddings = tf.nn.l2_normalize(embeddings, axis=2)
+  tokens = tf.split(embeddings, num_or_size_splits=seq_length, axis=1)
+  distances_list = []
+  for token in tokens:
+    distance = 1 - tf.matmul(token, embeddings, transpose_b=True)
+    mean_token_dist = tf.reduce_mean(distance, axis=-1)
+    distances_list.append(mean_token_dist)
+  distances_tensor = tf.stack(distances_list, axis=1)
+
+  per_example_loss = tf.reduce_mean(distances_tensor, axis=1)
+  per_example_loss = tf.check_numerics(per_example_loss, "per_example_loss division error")
+
+  predictions = tf.where(tf.greater(per_example_loss, threshold),
+                         tf.ones(per_example_loss.shape, dtype=tf.int32),
+                         tf.zeros(per_example_loss.shape, dtype=tf.int32))
+
+  masked_distances = gather_indexes(distances_tensor, masked_positions)
+  token_predictions = tf.where(tf.greater(masked_distances, threshold),
+                              tf.ones(masked_distances.shape, dtype=tf.int32),
+                              tf.zeros(masked_distances.shape, dtype=tf.int32))
+
+  per_example_loss = tf.where(tf.equal(fake_context_labels, 1),
+                              -per_example_loss, per_example_loss)
+
+  loss = tf.reduce_mean(per_example_loss)
+
+  return (loss, per_example_loss, predictions, token_predictions)
+
+
+def get_masked_lm_output(bert_config, input_tensor, positions,
                          label_ids, label_weights):
   """Get loss and log probs for the masked LM."""
   input_tensor = gather_indexes(input_tensor, positions)
@@ -271,9 +324,13 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
     # The output weights are the same as the input embeddings, but there is
     # an output-only bias for each token.
+    output_weights = tf.get_variable(
+        "output_weights",
+        shape=[2, bert_config.hidden_size],
+        initializer=modeling.create_initializer(bert_config.initializer_range))
     output_bias = tf.get_variable(
         "output_bias",
-        shape=[bert_config.vocab_size],
+        shape=[2],
         initializer=tf.zeros_initializer())
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
@@ -283,7 +340,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
     label_weights = tf.reshape(label_weights, [-1])
 
     one_hot_labels = tf.one_hot(
-        label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
+        label_ids, depth=2, dtype=tf.float32)
 
     # The `positions` tensor might be zero-padded (if the sequence is too
     # short to have the maximum number of predictions). The `label_weights`
@@ -296,28 +353,31 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
   return (loss, per_example_loss, log_probs)
 
+def get_fake_context_output(bert_config, input_tensor, labels):
+  """Get loss and log probs for the fake context prediction."""
 
-# def get_next_sentence_output(bert_config, input_tensor, labels):
-#   """Get loss and log probs for the next sentence prediction."""
+  # Simple binary classification. Note that 0 is "true context" and 1 is
+  # "fake context". This weight matrix is not used after pre-training.
+  with tf.variable_scope("cls/ctx_relationship"):
+    output_weights = tf.get_variable(
+        "output_weights",
+        shape=[2, bert_config.hidden_size],
+        initializer=modeling.create_initializer(bert_config.initializer_range))
+    output_bias = tf.get_variable(
+        "output_bias", shape=[2], initializer=tf.zeros_initializer())
 
-#   # Simple binary classification. Note that 0 is "next sentence" and 1 is
-#   # "random sentence". This weight matrix is not used after pre-training.
-#   with tf.variable_scope("cls/seq_relationship"):
-#     output_weights = tf.get_variable(
-#         "output_weights",
-#         shape=[2, bert_config.hidden_size],
-#         initializer=modeling.create_initializer(bert_config.initializer_range))
-#     output_bias = tf.get_variable(
-#         "output_bias", shape=[2], initializer=tf.zeros_initializer())
+    logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
+    logits = tf.nn.bias_add(logits, output_bias)
+    log_probs = tf.nn.log_softmax(logits, axis=-1)
 
-#     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
-#     logits = tf.nn.bias_add(logits, output_bias)
-#     log_probs = tf.nn.log_softmax(logits, axis=-1)
-#     labels = tf.reshape(labels, [-1])
-#     one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
-#     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
-#     loss = tf.reduce_mean(per_example_loss)
-#     return (loss, per_example_loss, log_probs)
+    labels = tf.reshape(labels, [-1])
+    one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
+
+    per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+
+    loss = tf.reduce_mean(per_example_loss)
+
+    return (loss, per_example_loss, log_probs)
 
 
 def gather_indexes(sequence_tensor, positions):
@@ -354,14 +414,16 @@ def input_fn_builder(input_files,
             tf.FixedLenFeature([max_seq_length], tf.int64),
         "segment_ids":
             tf.FixedLenFeature([max_seq_length], tf.int64),
+        "bounding_boxes":
+            tf.FixedLenFeature([max_seq_length, 4], tf.float32),
         "masked_lm_positions":
             tf.FixedLenFeature([max_predictions_per_seq], tf.int64),
         "masked_lm_ids":
             tf.FixedLenFeature([max_predictions_per_seq], tf.int64),
         "masked_lm_weights":
             tf.FixedLenFeature([max_predictions_per_seq], tf.float32),
-        # "next_sentence_labels":
-        #     tf.FixedLenFeature([1], tf.int64),
+        "fake_context_labels":
+            tf.FixedLenFeature([1], tf.int64),
     }
 
     # For training, we want a lot of parallel reading and shuffling.
@@ -388,10 +450,6 @@ def input_fn_builder(input_files,
       # out-of-range exceptions.
       d = d.repeat()
 
-    # We must `drop_remainder` on training because the TPU requires fixed
-    # size dimensions. For eval, we assume we are evaluating on the CPU or GPU
-    # and we *don't* want to drop the remainder, otherwise we wont cover
-    # every sample.
     d = d.apply(
         tf.contrib.data.map_and_batch(
             lambda record: _decode_record(record, name_to_features),
@@ -426,6 +484,8 @@ def main(_):
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
+  layer_indexes = [int(x) for x in FLAGS.layers.split(",")]
+
   tf.gfile.MakeDirs(FLAGS.output_dir)
 
   input_files = []
@@ -459,7 +519,8 @@ def main(_):
       num_train_steps=FLAGS.num_train_steps,
       num_warmup_steps=FLAGS.num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      use_one_hot_embeddings=FLAGS.use_tpu,
+      layer_indexes=layer_indexes)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.

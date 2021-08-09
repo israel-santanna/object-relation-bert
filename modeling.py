@@ -132,6 +132,7 @@ class BertModel(object):
                config,
                is_training,
                input_ids,
+               bounding_boxes,
                input_mask=None,
                token_type_ids=None,
                use_one_hot_embeddings=False,
@@ -143,6 +144,7 @@ class BertModel(object):
       is_training: bool. true for training model, false for eval model. Controls
         whether dropout will be applied.
       input_ids: int32 Tensor of shape [batch_size, seq_length].
+      bounding_boxes: float32 Tensor of shape [batch_size, seq_length, 4]
       input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
       token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
       use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
@@ -183,15 +185,21 @@ class BertModel(object):
         # normalize and perform dropout.
         self.embedding_output = embedding_postprocessor(
             input_tensor=self.embedding_output,
-            use_token_type=True,
+            use_token_type=False,
             token_type_ids=token_type_ids,
             token_type_vocab_size=config.type_vocab_size,
             token_type_embedding_name="token_type_embeddings",
-            use_position_embeddings=True,
+            use_position_embeddings=False,
+            bounding_boxes=bounding_boxes,
             position_embedding_name="position_embeddings",
+            use_geometric_embeddings=True,
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
             dropout_prob=config.hidden_dropout_prob)
+
+        tf.logging.info("input_ids shape: %s" % input_ids.shape)
+        tf.logging.info("bounding_boxes shape: %s" % bounding_boxes.shape)
+        geometric_embeddings = tf.map_fn(geometric_embedding, bounding_boxes)
 
       with tf.variable_scope("encoder"):
         # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
@@ -204,6 +212,7 @@ class BertModel(object):
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
         self.all_encoder_layers = transformer_model(
             input_tensor=self.embedding_output,
+            geometric_embeddings=geometric_embeddings,
             attention_mask=attention_mask,
             hidden_size=config.hidden_size,
             num_hidden_layers=config.num_hidden_layers,
@@ -431,12 +440,14 @@ def embedding_lookup(input_ids,
 
 
 def embedding_postprocessor(input_tensor,
+                            bounding_boxes,
                             use_token_type=False,
                             token_type_ids=None,
                             token_type_vocab_size=16,
                             token_type_embedding_name="token_type_embeddings",
-                            use_position_embeddings=True,
+                            use_position_embeddings=False,
                             position_embedding_name="position_embeddings",
+                            use_geometric_embeddings=True,
                             initializer_range=0.02,
                             max_position_embeddings=512,
                             dropout_prob=0.1):
@@ -523,6 +534,7 @@ def embedding_postprocessor(input_tensor,
       output += position_embeddings
 
   output = layer_norm_and_dropout(output, dropout_prob)
+
   return output
 
 
@@ -560,8 +572,139 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   return mask
 
 
+def extract_position_embedding(position_mat, max_position_embeddings=512, wave_length=10000):
+  # position_mat, [num_rois, nongt_dim, 4]
+  feat_range = tf.range(0, max_position_embeddings / 8)
+  dim_mat = tf.math.pow(tf.fill((1,), float(wave_length)),
+                        (8. / max_position_embeddings) * feat_range)
+  dim_mat = tf.reshape(dim_mat, shape=(1, 1, 1, -1))
+  position_mat = tf.expand_dims(100.0 * position_mat, axis=3)
+  div_mat = tf.math.divide(position_mat, dim_mat)
+  sin_mat = tf.math.sin(div_mat)
+  cos_mat = tf.math.cos(div_mat)
+
+  # embedding, [num_rois, nongt_dim, 4, feat_dim/4]
+  embedding = tf.concat([sin_mat, cos_mat], axis=3)
+  # embedding, [num_rois, nongt_dim, feat_dim]
+  new_shape = embedding.shape.as_list()[:2] + [max_position_embeddings]
+  embedding = tf.reshape(embedding, shape=new_shape)
+  embedding = tf.check_numerics(embedding, "embedding error")
+
+  return embedding
+
+
+def extract_position_matrix(bbox):
+  """ Extract position matrix
+
+  Args:
+      bbox: [num_boxes, 4]
+
+  Returns:
+      position_matrix: [num_boxes, nongt_dim, 4]
+  """
+  xmin, ymin, xmax, ymax = tf.split(bbox, num_or_size_splits=4, axis=1)
+
+  # [num_fg_classes, num_boxes, 1]
+  bbox_width = xmax - xmin + 1.
+  bbox_width = tf.check_numerics(bbox_width, "bbox_w error")
+
+  bbox_height = ymax - ymin + 1.
+  bbox_height = tf.check_numerics(bbox_height, "bbox_h error")
+
+  center_x = 0.5 * (xmin + xmax)
+  center_y = 0.5 * (ymin + ymax)
+
+  # [num_fg_classes, num_boxes, num_boxes]
+  delta_x = tf.math.subtract(center_x, tf.transpose(center_x))
+  delta_x = tf.check_numerics(delta_x, "delta_x subtract error")
+
+  delta_x = tf.div_no_nan(delta_x, bbox_width)
+  delta_x = tf.check_numerics(delta_x, "delta_x division error")
+
+  delta_x = tf.math.log(tf.math.maximum(tf.math.abs(delta_x), 1e-3))
+  delta_x = tf.check_numerics(delta_x, "delta_x log error")
+
+  delta_y = tf.math.subtract(center_y, tf.transpose(center_y))
+  delta_y = tf.check_numerics(delta_y, "delta_y subtract error")
+
+  delta_y = tf.div_no_nan(delta_y, bbox_height)
+  delta_y = tf.check_numerics(delta_y, "delta_y division error")
+
+  delta_y = tf.math.log(tf.math.maximum(tf.math.abs(delta_y), 1e-3))
+  delta_y = tf.check_numerics(delta_y, "delta_y log error")
+
+  delta_width = tf.div_no_nan(bbox_width, tf.transpose(bbox_width))
+  delta_width = tf.check_numerics(delta_width, "delta_w division error")
+
+  delta_width = tf.math.log(tf.math.maximum(tf.math.abs(delta_width), 1e-3))
+  delta_width = tf.check_numerics(delta_width, "delta_w log error")
+
+  delta_height = tf.div_no_nan(bbox_height, tf.transpose(bbox_height))
+  delta_height = tf.check_numerics(delta_height, "delta_h division error")
+
+  delta_height = tf.math.log(tf.math.maximum(tf.math.abs(delta_height), 1e-3))
+  delta_height = tf.check_numerics(delta_height, "delta_h log error")
+
+  concat_list = [delta_x, delta_y, delta_width, delta_height]
+  for idx, sym in enumerate(concat_list):
+    concat_list[idx] = tf.expand_dims(sym, axis=2)
+
+  position_matrix = tf.concat(concat_list, axis=2)
+  position_matrix = tf.check_numerics(position_matrix, "position_matrix error")
+
+  return position_matrix
+
+
+def geometric_embedding(bbox):
+  bbox = tf.check_numerics(bbox, "bbox error")
+
+  # [num_rois, nongt_dim, 4]
+  position_matrix = extract_position_matrix(bbox)
+
+  # [num_rois, nongt_dim, 64]
+  position_embedding = extract_position_embedding(position_matrix)
+
+  return position_embedding
+
+def relation_weight(geo_embeddings, attention_scores, initializer_range=0.02, num_attention_heads=1):
+
+  geo_embeddings_shape = geo_embeddings.shape.as_list()
+  batch_size = geo_embeddings_shape[0]
+  seq_length = geo_embeddings_shape[1]
+  if batch_size is None:
+    batch_size = -1
+
+  geo_embeddings_2d = reshape_to_matrix(geo_embeddings)
+
+  geo_weight = tf.layers.dense(
+    geo_embeddings_2d,
+    num_attention_heads,
+    activation=tf.nn.relu,
+    name="geo_weight",
+    kernel_initializer=create_initializer(initializer_range))
+
+  geo_weight_reshape = tf.reshape(geo_weight, shape=[batch_size, seq_length, seq_length, num_attention_heads])
+  geo_weight = tf.transpose(geo_weight_reshape, [0, 3, 1, 2])
+
+  # [B, N, F, T]
+  attention_exp = tf.math.exp(attention_scores)
+  attention_mult = geo_weight * attention_exp
+  # [B, N, F, 1]
+  attention_sum = tf.math.reduce_sum(attention_mult, 3, keepdims=True)
+
+  new_shape = attention_sum.shape.as_list()
+  if new_shape[0] is None:
+    new_shape[0] = -1
+  # [B, N, F, T]
+  attention_sum = tf.broadcast_to(attention_sum, new_shape)
+  rel_weight = tf.div_no_nan(attention_mult, attention_sum)
+
+  return rel_weight
+
+
 def attention_layer(from_tensor,
                     to_tensor,
+                    geometric_embeddings,
                     attention_mask=None,
                     num_attention_heads=1,
                     size_per_head=512,
@@ -720,9 +863,12 @@ def attention_layer(from_tensor,
     # effectively the same as removing these entirely.
     attention_scores += adder
 
+  # `rel_weight` = [B, N, F, T]
+  rel_weight = relation_weight(geometric_embeddings, attention_scores, initializer_range, num_attention_heads)
+
   # Normalize the attention scores to probabilities.
   # `attention_probs` = [B, N, F, T]
-  attention_probs = tf.nn.softmax(attention_scores)
+  attention_probs = tf.nn.softmax(rel_weight)
 
   # This is actually dropping out entire tokens to attend to, which might
   # seem a bit unusual, but is taken from the original Transformer paper.
@@ -757,6 +903,7 @@ def attention_layer(from_tensor,
 
 
 def transformer_model(input_tensor,
+                      geometric_embeddings,
                       attention_mask=None,
                       hidden_size=768,
                       num_hidden_layers=12,
@@ -838,6 +985,7 @@ def transformer_model(input_tensor,
           attention_head = attention_layer(
               from_tensor=layer_input,
               to_tensor=layer_input,
+              geometric_embeddings=geometric_embeddings,
               attention_mask=attention_mask,
               num_attention_heads=num_attention_heads,
               size_per_head=attention_head_size,
