@@ -15,6 +15,8 @@ The Object Relation BERT is trained on two binary tasks:
 * An adapted Masked LM prediction, where instead of trying to predict the right word, the network will predict, for each object in the image, if the object belongs to the image's context or not.
 * A fake context prediction, where it predicts whether the image's context as a whole makes sense. If the prediction is positive, it means there is probably at least one object that does not belong to this image's context.
 
+It also trains the model to minimize the distance between the objects' embeddings generated from BERT's last 4 layers. Making the embeddings from objects from the same context to be closer, and objects from different contexts to be far apart in the embedding's space.
+
 Once trained, we can use the model to validate an object detector's results, identifying images where the context might be wrong and indicating the objects that may have been misclassified, helping to avoid such misclassifications.
 
 ## Runnning
